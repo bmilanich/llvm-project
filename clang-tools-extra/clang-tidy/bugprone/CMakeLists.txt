@@ -3,7 +3,8 @@ set(LLVM_LINK_COMPONENTS
   FrontendOpenMP
   )
 
-add_clang_library(clangTidyBugproneModule STATIC
+  add_clang_library(clangTidyBugproneModule STATIC
+  ArgsSideEffectCheck.cpp
   ArgumentCommentCheck.cpp
   AssertSideEffectCheck.cpp
   AssignmentInIfConditionCheck.cpp
