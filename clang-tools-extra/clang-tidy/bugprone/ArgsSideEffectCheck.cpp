@@ -48,10 +48,10 @@ struct ArgDeps {
   using State = std::vector<EffectRef>;
   State reading;
   State writing;
-  void read(const Expr *E, ReferenceTo ref = ReferenceTo::Object) {
+  void read(const Expr *E, ReferenceTo ref = ReferenceTo::Pointer) {
     reading.emplace_back(ref, E);
   }
-  void write(const Expr *E, ReferenceTo ref = ReferenceTo::Object) {
+  void write(const Expr *E, ReferenceTo ref = ReferenceTo::Pointer) {
     writing.emplace_back(ref, E);
   }
 };
@@ -93,17 +93,12 @@ bool sameExpr(const Expr *x, const Expr *y) {
   }
   if (auto DRE = cast2<DeclRefExpr>(x, y); DRE) {
     const auto Value = call2(*DRE, [](auto p) { return p->getDecl(); });
-    return Value.first->getName() == Value.second->getName();
+    return same(Value);
   }
 
   if (auto ME = cast2<MemberExpr>(x, y); ME) {
     auto Value = call2(*ME, [](auto p) { return p->getMemberDecl(); });
-    if (Value.first->getName() == Value.second->getName()) {
-      auto Base = call2(*ME, [](auto p) { return p->getBase(); });
-      sameExpr(Base.first, Base.second);
-    } else {
-      return false;
-    }
+    return same(Value);
   }
   if (auto Call = cast2<CallExpr>(x, y); Call) {
     auto Callee =
@@ -165,16 +160,17 @@ bool intersectExpr(const EffectRef &r1, const EffectRef &r2) {
   const auto *MemY = dyn_cast<MemberExpr>(y);
   if (MemX && MemY) {
     return sameExpr(MemX, MemY);
-  } else if (MemX) {
+  } else if (MemX && r2.to == ReferenceTo::Object) {
     return sameExpr(MemX->getBase(), y);
-  } else if (MemY) {
+  } else if (MemY && r1.to == ReferenceTo::Object) {
     return sameExpr(x, MemY->getBase());
   }
   return sameExpr(x, y);
 }
 
 void collectState(const Stmt *arg, ArgDeps &state,
-                  ValueFor vf = ValueFor::Reading) {
+                  ValueFor vf = ValueFor::Reading,
+                  ReferenceTo ptr_ref = ReferenceTo::Pointer) {
 
   const auto *E = dyn_cast<Expr>(arg);
   if (E == nullptr) {
@@ -189,18 +185,28 @@ void collectState(const Stmt *arg, ArgDeps &state,
   const auto *ME = dyn_cast<MemberExpr>(arg);
   const auto *DRE = dyn_cast<DeclRefExpr>(arg);
 
-  if (DRE && isConstExpr(DRE))
-    return;
-
-  if (ME || DRE) {
+  if (DRE) {
+    if (isConstExpr(DRE)) {
+      return;
+    }
     if (vf == ValueFor::Reading) {
-      state.read(E);
+      state.read(DRE, ptr_ref);
     } else {
-      state.write(E);
+      state.write(DRE, ptr_ref);
+    }
+    return;
+  }
+
+  if (ME) {
+    if (vf == ValueFor::Reading) {
+      state.read(E, ReferenceTo::Pointer);
+    } else {
+      state.write(E, ReferenceTo::Pointer);
     }
     if (ME) {
       // see if the base expression also touches the state
-      collectState(ME->getBase(), state, ValueFor::Reading);
+      collectState(ME->getBase()->IgnoreImpCasts(), state, ValueFor::Reading,
+                   ReferenceTo::Pointer);
     }
     return;
   }
@@ -266,7 +272,7 @@ void collectState(const Stmt *arg, ArgDeps &state,
       }
     }
     const auto NArgs = OpCallExpr->getNumArgs();
-    collectState(OpCallExpr->getArg(0), state, lhs_vf);
+    collectState(OpCallExpr->getArg(0), state, lhs_vf, ReferenceTo::Object);
     for (unsigned i = 1; i < NArgs; ++i) {
       collectState(OpCallExpr->getArg(i), state, ValueFor::Reading);
     }
@@ -293,8 +299,9 @@ void collectState(const Stmt *arg, ArgDeps &state,
         if (const auto *MemCall = dyn_cast<CXXMemberCallExpr>(arg)) {
           const Expr *callee = MemCall->getCallee();
           if (const auto *ME = dyn_cast<MemberExpr>(callee)) {
-            collectState(ME->getBase(), state,
-                         is_const ? ValueFor::Reading : ValueFor::Writing);
+            collectState(ME->getBase()->IgnoreImpCasts(), state,
+                         is_const ? ValueFor::Reading : ValueFor::Writing,
+                         ReferenceTo::Object);
           }
         }
       }
@@ -314,10 +321,15 @@ void collectState(const Stmt *arg, ArgDeps &state,
     }
     return;
   }
+  if (dyn_cast<LambdaExpr>(arg)) {
+    // do not care about lambdas and if they pass through
+    // the mutations in the body can cause a false positive
+    return;
+  }
   // otherwise just go through children
   for (const Stmt *Child : E->children()) {
     if (Child)
-      collectState(Child, state, vf);
+      collectState(Child, state, vf, ptr_ref);
   }
 }
 #if 0  
@@ -388,7 +400,7 @@ void ArgsSideEffectCheck::check(const MatchFinder::MatchResult &Result) {
     }
     state.reserve(nargs);
     for (unsigned i = isMember; i != nargs; ++i) {
-      const Expr *Arg = CE->getArg(i);
+      const Expr *Arg = CE->getArg(i)->IgnoreImpCasts();
 
       state.emplace_back();
       collectState(Arg, state[i - isMember], ValueFor::Reading);
@@ -401,7 +413,7 @@ void ArgsSideEffectCheck::check(const MatchFinder::MatchResult &Result) {
     const unsigned nargs = CtrE->getNumArgs();
     state.reserve(nargs);
     for (unsigned i = 0; i != nargs; ++i) {
-      const Expr *Arg = CtrE->getArg(i);
+      const Expr *Arg = CtrE->getArg(i)->IgnoreImpCasts();
       state.emplace_back();
       collectState(Arg, state[i], ValueFor::Reading);
       // debugDump(CtrE, policy, state);
