@@ -295,7 +295,15 @@ void collectState(const Stmt *arg, ArgDeps &state,
         }
       }
       if (const auto *MethodDecl = dyn_cast<CXXMethodDecl>(FuncDecl)) {
-        bool is_const = MethodDecl->isConst() || MethodDecl->isConstexpr();
+        bool is_const = MethodDecl->isConst();
+	if(!is_const && MethodDecl->hasBody()) {
+	  // if a non-const method has a body we can check if it's changing the state
+	  ArgDeps phantom;
+	  collectState(MethodDecl->getBody(),phantom,ValueFor::Reading);
+	  if(phantom.writing.size() == 0) {
+	    is_const = true;
+	  }
+	}
         if (const auto *MemCall = dyn_cast<CXXMemberCallExpr>(arg)) {
           const Expr *callee = MemCall->getCallee();
           if (const auto *ME = dyn_cast<MemberExpr>(callee)) {
