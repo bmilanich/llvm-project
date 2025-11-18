@@ -33,7 +33,7 @@ template <> struct std::hash<std::pair<unsigned, unsigned>> {
 
 namespace clang::tidy::bugprone {
 namespace {
-  enum class ValueFor { Reading, Writing };
+enum class ValueFor { Reading, Writing };
 enum class ReferenceTo { Pointer, Object };
 
 struct EffectRef {
@@ -167,11 +167,12 @@ bool intersectExpr(const EffectRef &r1, const EffectRef &r2) {
   }
   return sameExpr(x, y);
 }
+std::unordered_set<std::string_view> IgnoredFunctionNames = {"begin", "end"};
 class StateCollector {
   using MethodCache = std::map<const CXXMethodDecl *, bool>;
   MethodCache &PureMethods;
   ArgDeps &state;
-  std::unordered_set<const CXXMethodDecl*> seenMethod;
+  std::unordered_set<const CXXMethodDecl *> seenMethod;
 
 public:
   StateCollector(MethodCache &cache, ArgDeps &s)
@@ -207,7 +208,7 @@ public:
     if (ME) {
       if (vf == ValueFor::Reading) {
         state.read(E, ReferenceTo::Pointer);
-      } else if(vf == ValueFor::Writing) {
+      } else if (vf == ValueFor::Writing) {
         state.write(E, ReferenceTo::Pointer);
       }
       if (ME) {
@@ -287,6 +288,10 @@ public:
     }
     if (const auto *CExpr = dyn_cast<CallExpr>(arg)) {
       if (const auto *FuncDecl = CExpr->getDirectCallee()) {
+        if (auto it = IgnoredFunctionNames.find(FuncDecl->getName());
+            it != IgnoredFunctionNames.end()) {
+          return;
+        }
         for (size_t I = 0; I < FuncDecl->getNumParams(); I++) {
           const ParmVarDecl *P = FuncDecl->getParamDecl(I);
           const Expr *ArgExpr =
@@ -309,11 +314,11 @@ public:
             if (auto it = PureMethods.find(MethodDecl);
                 it != PureMethods.end()) {
               is_const = it->second;
-            } else if(seenMethod.find(MethodDecl) == seenMethod.end()) {
+            } else if (seenMethod.find(MethodDecl) == seenMethod.end()) {
               ArgDeps phantom;
-	      StateCollector child(PureMethods,phantom);
-	      child.seenMethod = seenMethod;
-	      child.seenMethod.insert(MethodDecl);
+              StateCollector child(PureMethods, phantom);
+              child.seenMethod = seenMethod;
+              child.seenMethod.insert(MethodDecl);
 
               child.collectState(MethodDecl->getBody(), ValueFor::Reading);
               if (phantom.writing.size() == 0) {
@@ -417,7 +422,7 @@ void ArgsSideEffectCheck::check(const MatchFinder::MatchResult &Result) {
       const Expr *Arg = CE->getArg(i)->IgnoreImpCasts();
 
       state.emplace_back();
-      StateCollector collector(PureMethods,state[i-isMember]);
+      StateCollector collector(PureMethods, state[i - isMember]);
       collector.collectState(Arg, ValueFor::Reading);
     }
     // debugDump(CE, policy, state);
@@ -430,7 +435,7 @@ void ArgsSideEffectCheck::check(const MatchFinder::MatchResult &Result) {
     for (unsigned i = 0; i != nargs; ++i) {
       const Expr *Arg = CtrE->getArg(i)->IgnoreImpCasts();
       state.emplace_back();
-      StateCollector collector(PureMethods,state[i]);
+      StateCollector collector(PureMethods, state[i]);
       collector.collectState(Arg, ValueFor::Reading);
       // debugDump(CtrE, policy, state);
     }
