@@ -33,7 +33,7 @@ template <> struct std::hash<std::pair<unsigned, unsigned>> {
 
 namespace clang::tidy::bugprone {
 namespace {
-  enum class ValueFor { Reading, Writing, Referencing };
+  enum class ValueFor { Reading, Writing };
 enum class ReferenceTo { Pointer, Object };
 
 struct EffectRef {
@@ -194,7 +194,7 @@ public:
     const auto *DRE = dyn_cast<DeclRefExpr>(arg);
 
     if (DRE) {
-      if (isConstExpr(DRE) || vf == ValueFor::Referencing) {
+      if (isConstExpr(DRE)) {
         return;
       } else if (vf == ValueFor::Reading) {
         state.read(DRE, ptr_ref);
