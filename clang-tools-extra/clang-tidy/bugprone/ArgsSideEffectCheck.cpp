@@ -33,7 +33,7 @@ template <> struct std::hash<std::pair<unsigned, unsigned>> {
 
 namespace clang::tidy::bugprone {
 namespace {
-enum class ValueFor { Reading, Writing };
+  enum class ValueFor { Reading, Writing, Referencing };
 enum class ReferenceTo { Pointer, Object };
 
 struct EffectRef {
@@ -167,192 +167,198 @@ bool intersectExpr(const EffectRef &r1, const EffectRef &r2) {
   }
   return sameExpr(x, y);
 }
+class StateCollector {
+  using MethodCache = std::map<const CXXMethodDecl *, bool>;
+  MethodCache &PureMethods;
+  ArgDeps &state;
+  std::unordered_set<const CXXMethodDecl*> seenMethod;
 
-void collectState(const Stmt *arg, ArgDeps &state,
-                  ValueFor vf = ValueFor::Reading,
-                  ReferenceTo ptr_ref = ReferenceTo::Pointer) {
+public:
+  StateCollector(MethodCache &cache, ArgDeps &s)
+      : PureMethods(cache), state(s) {}
 
-  const auto *E = dyn_cast<Expr>(arg);
-  if (E == nullptr) {
-    // not an Expr, but might have Expr children
-    for (const Stmt *Child : arg->children()) {
-      if (Child)
-        collectState(Child, state, vf);
-    }
-    return;
-  }
+  void collectState(const Stmt *arg, ValueFor vf = ValueFor::Reading,
+                    ReferenceTo ptr_ref = ReferenceTo::Pointer) {
 
-  const auto *ME = dyn_cast<MemberExpr>(arg);
-  const auto *DRE = dyn_cast<DeclRefExpr>(arg);
-
-  if (DRE) {
-    if (isConstExpr(DRE)) {
+    const auto *E = dyn_cast<Expr>(arg);
+    if (E == nullptr) {
+      // not an Expr, but might have Expr children
+      for (const Stmt *Child : arg->children()) {
+        if (Child)
+          collectState(Child, vf);
+      }
       return;
     }
-    if (vf == ValueFor::Reading) {
-      state.read(DRE, ptr_ref);
-    } else {
-      state.write(DRE, ptr_ref);
-    }
-    return;
-  }
 
-  if (ME) {
-    if (vf == ValueFor::Reading) {
-      state.read(E, ReferenceTo::Pointer);
-    } else {
-      state.write(E, ReferenceTo::Pointer);
+    const auto *ME = dyn_cast<MemberExpr>(arg);
+    const auto *DRE = dyn_cast<DeclRefExpr>(arg);
+
+    if (DRE) {
+      if (isConstExpr(DRE) || vf == ValueFor::Referencing) {
+        return;
+      } else if (vf == ValueFor::Reading) {
+        state.read(DRE, ptr_ref);
+      } else {
+        state.write(DRE, ptr_ref);
+      }
+      return;
     }
+
     if (ME) {
-      // see if the base expression also touches the state
-      collectState(ME->getBase()->IgnoreImpCasts(), state, ValueFor::Reading,
-                   ReferenceTo::Pointer);
-    }
-    return;
-  }
-  if (const auto *Op = dyn_cast<UnaryOperator>(arg)) {
-    UnaryOperator::Opcode OC = Op->getOpcode();
-    const Expr *target = Op->getSubExpr();
-    switch (OC) {
-    case UO_PostInc:
-    case UO_PostDec:
-    case UO_PreInc:
-    case UO_PreDec:
-      collectState(target, state, ValueFor::Writing);
-      break;
-    case UO_AddrOf:
-      collectState(target, state, vf);
-      break;
-    default:
-      collectState(target, state, ValueFor::Reading);
-    }
-  }
-  if (const auto *Op = dyn_cast<BinaryOperator>(arg)) {
-    ValueFor lhs_vf = ValueFor::Reading;
-    if (Op->isAssignmentOp()) {
-      lhs_vf = ValueFor::Writing;
-    }
-    collectState(Op->getLHS(), state, lhs_vf);
-    collectState(Op->getRHS(), state, ValueFor::Reading);
-    return;
-  }
-  if (const auto *OpCallExpr = dyn_cast<CXXOperatorCallExpr>(arg)) {
-    ValueFor lhs_vf = ValueFor::Reading;
-    if (const auto *MethodDecl =
-            dyn_cast_or_null<CXXMethodDecl>(OpCallExpr->getDirectCallee())) {
-      if (!MethodDecl->isConst()) {
-
-        OverloadedOperatorKind OpKind = OpCallExpr->getOperator();
-
-        if (OpKind == OO_Equal || OpKind == OO_PlusEqual ||
-            OpKind == OO_MinusEqual || OpKind == OO_StarEqual ||
-            OpKind == OO_SlashEqual || OpKind == OO_AmpEqual ||
-            OpKind == OO_PipeEqual || OpKind == OO_CaretEqual ||
-            OpKind == OO_LessLessEqual || OpKind == OO_GreaterGreaterEqual ||
-            OpKind == OO_LessLess || OpKind == OO_GreaterGreater ||
-            OpKind == OO_PlusPlus || OpKind == OO_MinusMinus ||
-            OpKind == OO_PercentEqual || OpKind == OO_New ||
-            OpKind == OO_Delete || OpKind == OO_Array_New ||
-            OpKind == OO_Array_Delete) {
-          lhs_vf = ValueFor::Writing;
-        }
+      if (vf == ValueFor::Reading) {
+        state.read(E, ReferenceTo::Pointer);
+      } else if(vf == ValueFor::Writing) {
+        state.write(E, ReferenceTo::Pointer);
       }
-      const auto *BaseRef =
-          dyn_cast<DeclRefExpr>(OpCallExpr->getArg(0)->IgnoreImpCasts());
-      const ValueDecl *VD = BaseRef ? BaseRef->getDecl() : nullptr;
-      if (const auto *Var = VD ? dyn_cast<VarDecl>(VD) : nullptr) {
-        QualType T = Var->getType();
-        if (const CXXRecordDecl *Record = T->getAsCXXRecordDecl()) {
-          if (Record->isLambda() && MethodDecl->hasBody()) {
-            // a lambda's operator() can modify enclosing state
-            // even if the operator is const itself
-            collectState(MethodDecl->getBody(), state, ValueFor::Reading);
-          }
-        }
-      }
-    }
-    const auto NArgs = OpCallExpr->getNumArgs();
-    collectState(OpCallExpr->getArg(0), state, lhs_vf, ReferenceTo::Object);
-    for (unsigned i = 1; i < NArgs; ++i) {
-      collectState(OpCallExpr->getArg(i), state, ValueFor::Reading);
-    }
-    return;
-  }
-  if (const auto *CExpr = dyn_cast<CallExpr>(arg)) {
-    if (const auto *FuncDecl = CExpr->getDirectCallee()) {
-      for (size_t I = 0; I < FuncDecl->getNumParams(); I++) {
-        const ParmVarDecl *P = FuncDecl->getParamDecl(I);
-        const Expr *ArgExpr =
-            I < CExpr->getNumArgs() ? CExpr->getArg(I) : nullptr;
-        const QualType PT = P->getType().getCanonicalType();
-        ValueFor vf = ValueFor::Reading;
-        if (ArgExpr) {
-          if (!ArgExpr->isXValue() && PT->isReferenceType() &&
-              !PT.getNonReferenceType().isConstQualified()) {
-            vf = ValueFor::Writing;
-          }
-          collectState(ArgExpr, state, vf);
-        }
-      }
-      if (const auto *MethodDecl = dyn_cast<CXXMethodDecl>(FuncDecl)) {
-        bool is_const = MethodDecl->isConst();
-	if(!is_const && MethodDecl->hasBody()) {
-	  // if a non-const method has a body we can check if it's changing the state
-	  ArgDeps phantom;
-	  collectState(MethodDecl->getBody(),phantom,ValueFor::Reading);
-	  if(phantom.writing.size() == 0) {
-	    is_const = true;
-	  }
-	}
-        if (const auto *MemCall = dyn_cast<CXXMemberCallExpr>(arg)) {
-          const Expr *callee = MemCall->getCallee();
-          if (const auto *ME = dyn_cast<MemberExpr>(callee)) {
-            collectState(ME->getBase()->IgnoreImpCasts(), state,
-                         is_const ? ValueFor::Reading : ValueFor::Writing,
-                         ReferenceTo::Object);
-          }
-        }
+      if (ME) {
+        // see if the base expression also touches the state
+        collectState(ME->getBase()->IgnoreImpCasts(), ValueFor::Reading,
+                     ReferenceTo::Pointer);
       }
       return;
     }
-    return;
-  }
+    if (const auto *Op = dyn_cast<UnaryOperator>(arg)) {
+      UnaryOperator::Opcode OC = Op->getOpcode();
+      const Expr *target = Op->getSubExpr();
+      switch (OC) {
+      case UO_PostInc:
+      case UO_PostDec:
+      case UO_PreInc:
+      case UO_PreDec:
+        collectState(target, ValueFor::Writing);
+        break;
+      case UO_AddrOf:
+        collectState(target, vf);
+        break;
+      default:
+        collectState(target, ValueFor::Reading);
+      }
+    }
+    if (const auto *Op = dyn_cast<BinaryOperator>(arg)) {
+      ValueFor lhs_vf = ValueFor::Reading;
+      if (Op->isAssignmentOp()) {
+        lhs_vf = ValueFor::Writing;
+      }
+      collectState(Op->getLHS(), lhs_vf);
+      collectState(Op->getRHS(), ValueFor::Reading);
+      return;
+    }
+    if (const auto *OpCallExpr = dyn_cast<CXXOperatorCallExpr>(arg)) {
+      ValueFor lhs_vf = ValueFor::Reading;
+      if (const auto *MethodDecl =
+              dyn_cast_or_null<CXXMethodDecl>(OpCallExpr->getDirectCallee())) {
+        if (!MethodDecl->isConst()) {
 
-  if (dyn_cast<CXXThisExpr>(arg)) {
-    switch (vf) {
-    case ValueFor::Reading:
-      state.read(E);
-      break;
-    case ValueFor::Writing:
-      state.write(E);
-      break;
+          OverloadedOperatorKind OpKind = OpCallExpr->getOperator();
+
+          if (OpKind == OO_Equal || OpKind == OO_PlusEqual ||
+              OpKind == OO_MinusEqual || OpKind == OO_StarEqual ||
+              OpKind == OO_SlashEqual || OpKind == OO_AmpEqual ||
+              OpKind == OO_PipeEqual || OpKind == OO_CaretEqual ||
+              OpKind == OO_LessLessEqual || OpKind == OO_GreaterGreaterEqual ||
+              OpKind == OO_LessLess || OpKind == OO_GreaterGreater ||
+              OpKind == OO_PlusPlus || OpKind == OO_MinusMinus ||
+              OpKind == OO_PercentEqual || OpKind == OO_New ||
+              OpKind == OO_Delete || OpKind == OO_Array_New ||
+              OpKind == OO_Array_Delete) {
+            lhs_vf = ValueFor::Writing;
+          }
+        }
+        const auto *BaseRef =
+            dyn_cast<DeclRefExpr>(OpCallExpr->getArg(0)->IgnoreImpCasts());
+        const ValueDecl *VD = BaseRef ? BaseRef->getDecl() : nullptr;
+        if (const auto *Var = VD ? dyn_cast<VarDecl>(VD) : nullptr) {
+          QualType T = Var->getType();
+          if (const CXXRecordDecl *Record = T->getAsCXXRecordDecl()) {
+            if (Record->isLambda() && MethodDecl->hasBody()) {
+              // a lambda's operator() can modify enclosing state
+              // even if the operator is const itself
+              collectState(MethodDecl->getBody(), ValueFor::Reading);
+            }
+          }
+        }
+      }
+      const auto NArgs = OpCallExpr->getNumArgs();
+      collectState(OpCallExpr->getArg(0), lhs_vf, ReferenceTo::Object);
+      for (unsigned i = 1; i < NArgs; ++i) {
+        collectState(OpCallExpr->getArg(i), ValueFor::Reading);
+      }
+      return;
     }
-    return;
-  }
-  if (dyn_cast<LambdaExpr>(arg)) {
-    // do not care about lambdas and if they pass through
-    // the mutations in the body can cause a false positive
-    return;
-  }
-  // otherwise just go through children
-  for (const Stmt *Child : E->children()) {
-    if (Child)
-      collectState(Child, state, vf, ptr_ref);
-  }
-}
-#if 0  
-bool isNonConstRefType(const ParmVarDecl *P) {
-  if (P) {
-    const QualType PT = P->getType().getCanonicalType();
-    if (const auto *PtrType = PT->getAs<PointerType>()) {
-      return !PtrType->getPointeeType().isConstQualified();
-    } else if (PT->isReferenceType()) {
-      return !PT.getNonReferenceType().isConstQualified();
+    if (const auto *CExpr = dyn_cast<CallExpr>(arg)) {
+      if (const auto *FuncDecl = CExpr->getDirectCallee()) {
+        for (size_t I = 0; I < FuncDecl->getNumParams(); I++) {
+          const ParmVarDecl *P = FuncDecl->getParamDecl(I);
+          const Expr *ArgExpr =
+              I < CExpr->getNumArgs() ? CExpr->getArg(I) : nullptr;
+          const QualType PT = P->getType().getCanonicalType();
+          ValueFor vf = ValueFor::Reading;
+          if (ArgExpr) {
+            if (!ArgExpr->isXValue() && PT->isReferenceType() &&
+                !PT.getNonReferenceType().isConstQualified()) {
+              vf = ValueFor::Writing;
+            }
+            collectState(ArgExpr, vf);
+          }
+        }
+        if (const auto *MethodDecl = dyn_cast<CXXMethodDecl>(FuncDecl)) {
+          bool is_const = MethodDecl->isConst();
+          if (!is_const && MethodDecl->hasBody()) {
+            // if a non-const method has a body we can check if it's changing
+            // the state
+            if (auto it = PureMethods.find(MethodDecl);
+                it != PureMethods.end()) {
+              is_const = it->second;
+            } else if(seenMethod.find(MethodDecl) == seenMethod.end()) {
+              ArgDeps phantom;
+	      StateCollector child(PureMethods,phantom);
+	      child.seenMethod = seenMethod;
+	      child.seenMethod.insert(MethodDecl);
+
+              child.collectState(MethodDecl->getBody(), ValueFor::Reading);
+              if (phantom.writing.size() == 0) {
+                is_const = true;
+              }
+              PureMethods.insert({MethodDecl, is_const});
+            }
+          }
+          if (const auto *MemCall = dyn_cast<CXXMemberCallExpr>(arg)) {
+            const Expr *callee = MemCall->getCallee();
+            if (const auto *ME = dyn_cast<MemberExpr>(callee)) {
+              collectState(ME->getBase()->IgnoreImpCasts(),
+                           is_const ? ValueFor::Reading : ValueFor::Writing,
+                           ReferenceTo::Object);
+            }
+          }
+        }
+        return;
+      }
+      return;
+    }
+
+    if (dyn_cast<CXXThisExpr>(arg)) {
+      switch (vf) {
+      case ValueFor::Reading:
+        state.read(E);
+        break;
+      case ValueFor::Writing:
+        state.write(E);
+        break;
+      }
+      return;
+    }
+    if (dyn_cast<LambdaExpr>(arg)) {
+      // do not care about lambdas and if they pass through
+      // the mutations in the body can cause a false positive
+      return;
+    }
+    // otherwise just go through children
+    for (const Stmt *Child : E->children()) {
+      if (Child)
+        collectState(Child, vf, ptr_ref);
     }
   }
-  return false;
-}
-#endif
+};
 
 template <typename T>
 void debugDump(const T *expr, const PrintingPolicy &policy,
@@ -411,7 +417,8 @@ void ArgsSideEffectCheck::check(const MatchFinder::MatchResult &Result) {
       const Expr *Arg = CE->getArg(i)->IgnoreImpCasts();
 
       state.emplace_back();
-      collectState(Arg, state[i - isMember], ValueFor::Reading);
+      StateCollector collector(PureMethods,state[i-isMember]);
+      collector.collectState(Arg, ValueFor::Reading);
     }
     // debugDump(CE, policy, state);
 
@@ -423,7 +430,8 @@ void ArgsSideEffectCheck::check(const MatchFinder::MatchResult &Result) {
     for (unsigned i = 0; i != nargs; ++i) {
       const Expr *Arg = CtrE->getArg(i)->IgnoreImpCasts();
       state.emplace_back();
-      collectState(Arg, state[i], ValueFor::Reading);
+      StateCollector collector(PureMethods,state[i]);
+      collector.collectState(Arg, ValueFor::Reading);
       // debugDump(CtrE, policy, state);
     }
   }

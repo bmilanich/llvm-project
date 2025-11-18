@@ -13,9 +13,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include <string>
+#include <map>
 
 namespace clang::tidy::bugprone {
 class ArgsSideEffectCheck : public ClangTidyCheck {
+  std::map<const CXXMethodDecl*, bool> PureMethods;
 public:
   ArgsSideEffectCheck(StringRef Name, ClangTidyContext *Context);
   //  void storeOptions(ClangTidyOptions::OptionMap &Opts) override;
